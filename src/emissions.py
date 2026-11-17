@@ -200,7 +200,15 @@ REFEREE_EVENT_PER_FRAME_BONUS = 0.02
 # =============================================================================
 H1_START, H1_END = 11185, 90651
 H2_START, H2_END = 110808, 190197
+# Second-half kick-off. This literal is a frame of this match, so it is used ONLY to reproduce
+# the submitted file (flags off). With dead_ball_anchors the pipeline passes h2_kickoff, derived
+# at run time from the Smart Tagging 'Kick Off (Start)' clip and the ball track
+# (episodes.derive_second_half_kickoff).
 H2_KICKOFF = 113742
+
+# Dead-ball anchors (improvement #4): a ball lost on the pitch is live until its extrapolated
+# line crossing, if that crossing is within this many frames of the start of the gap.
+GAP_CROSSING_MAX_LIVE_FRAMES = 50
 
 # =============================================================================
 # 12. AUGMENTED 5-STATE BASELINE CONSTANTS
@@ -222,6 +230,8 @@ def compute_log_emissions(
     episode_evidence: Optional[EpisodeEvidence] = None,
     control_evidence: Optional[ControlEvidence] = None,
     augmented_5state: bool = False,
+    dead_ball_anchors: bool = False,
+    h2_kickoff: Optional[int] = None,
 ) -> np.ndarray:
     """Computes shape (n_frames, 3) log-emission matrix for H, A, D states.
 
@@ -236,6 +246,12 @@ def compute_log_emissions(
         episode_evidence: Optional macro kinematic episode evidence from Stage 2.
         control_evidence: Optional micro interaction and turnover evidence from Stage 3.
         augmented_5state: Whether to return 5-state augmented matrix {H_c, H_u, A_c, A_u, D}.
+        dead_ball_anchors: Opt-in (improvement #4). A stoppage gap is live until the ball's
+            extrapolated line crossing, set-piece preparation stops at the detected restart, and
+            a goal window ends at the detected kick-off. Needs episode_evidence built with
+            dead_ball_anchors=True.
+        h2_kickoff: Second-half kick-off frame derived at run time. None keeps the legacy
+            H2_KICKOFF literal (reproduces the submitted file).
 
     Returns:
         log_B: np.ndarray of shape (n_frames, 3) or (n_frames, 5) containing ln B(t, k).
@@ -532,6 +548,14 @@ def compute_log_emissions(
         else np.zeros(n_frames, dtype=bool)
     )
 
+    anchor_restarts = None
+    anchor_crossings = None
+    if dead_ball_anchors and episode_evidence is not None:
+        anchor_restarts = episode_evidence.set_piece_restarts or {}
+        anchor_crossings = episode_evidence.line_crossings
+        if anchor_crossings is None:
+            anchor_crossings = np.zeros(0, dtype=np.int64)
+
     for gap in tracking.missing_gaps:
         gap_start, gap_end = gap.start_frame, gap.end_frame
         non_restart_mask = ~is_restart_kick[gap_start : gap_end + 1]
@@ -540,6 +564,15 @@ def compute_log_emissions(
         gap_frame_indices = np.arange(gap_start, gap_end + 1)[non_restart_mask]
 
         if gap.category == "stoppage":
+            if anchor_crossings is not None:
+                inside = anchor_crossings[(anchor_crossings > gap_start) & (anchor_crossings <= gap_end + 1)]
+                if len(inside) and inside[0] - gap_start <= GAP_CROSSING_MAX_LIVE_FRAMES:
+                    # The ball was lost on the pitch and crossed the line later: live until then.
+                    live_part = gap_frame_indices[gap_frame_indices < inside[0]]
+                    log_B[live_part, STATE_H] = GAP_ACTIVE_LIVE_EMISSION
+                    log_B[live_part, STATE_A] = GAP_ACTIVE_LIVE_EMISSION
+                    log_B[live_part, STATE_D] = NEG_INF
+                    gap_frame_indices = gap_frame_indices[gap_frame_indices >= inside[0]]
             log_B[gap_frame_indices, STATE_D] = HALFTIME_DEAD_BASELINE
             log_B[gap_frame_indices, STATE_H] = HALFTIME_LIVE_PENALTY
             log_B[gap_frame_indices, STATE_A] = HALFTIME_LIVE_PENALTY
@@ -563,6 +596,11 @@ def compute_log_emissions(
             sp_start = max(0, set_piece["start"])
             sp_end = min(n_frames - 1, set_piece["end"])
             prep_limit = min(sp_end, sp_start + SET_PIECE_PREP_MAX_FRAMES)
+            if anchor_restarts is not None and anchor_restarts.get(set_piece["start"]) is not None:
+                # Preparation ends at the restart; after it the ball is live even if it rolls slowly.
+                prep_limit = min(prep_limit, anchor_restarts[set_piece["start"]] - 1)
+            if prep_limit < sp_start:
+                continue
             is_ball_stationary = (
                 tracking.ball_velocity[sp_start : prep_limit + 1] < SET_PIECE_BALL_STATIONARY_VELOCITY
             ) & tracking.ball_observed[sp_start : prep_limit + 1]
@@ -586,7 +624,9 @@ def compute_log_emissions(
             # Truncate at subsequent kickoff set-piece:
             for sp in smart_tags.get("set_pieces", []):
                 if sp["start"] >= goal_start and "kick off" in sp.get("type", "").lower():
-                    goal_end = min(goal_end, sp["start"])
+                    kick = anchor_restarts.get(sp["start"]) if anchor_restarts is not None else None
+                    # With anchors the goal window runs to the detected kick-off, not the clip start.
+                    goal_end = min(goal_end, kick - 1 if kick is not None else sp["start"])
                     break
 
             # Locate exact goal line crossing:
@@ -632,7 +672,7 @@ def compute_log_emissions(
         static_dead_intervals = [
             (0, H1_START - 1),
             (H1_END + 1, H2_START - 1),
-            (H2_START, H2_KICKOFF - 1),
+            (H2_START, (h2_kickoff if h2_kickoff is not None else H2_KICKOFF) - 1),
             (H2_END + 1, n_frames - 1),
         ]
         for block_start, block_end in static_dead_intervals:

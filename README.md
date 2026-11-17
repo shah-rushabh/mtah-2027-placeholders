@@ -30,10 +30,12 @@ Run the full unit and invariant test suite:
 ```bash
 python3 -m unittest discover -s tests -p "test_*.py"
 ```
-*(All 204 unit and adversarial tests pass in ~0.2 seconds).*
+*(All 260 unit and adversarial tests pass in ~0.5 seconds).*
 
 ### 3. Generate Submission CSV
-Execute the full 6-stage end-to-end pipeline (supports `data/` or `data/tactical/`):
+Execute the full 6-stage end-to-end pipeline. It reads the tactical tracking, its metadata XML,
+the Smart Tagging XML, and the broadcast tracking and homography (used only to fill missing ball
+frames). It supports a flat `data/` folder or the organisers' `data/tactical/` + `data/broadcast/` layout:
 ```bash
 # Standard reproduction:
 bash run.sh
@@ -49,12 +51,22 @@ python3 -m src.run_pipeline \
     --smart-tagging data/BAR-ATH_tactical_smart_tagging.xml \
     --flight-barrier \
     --confirm-turnover-frames 50 \
+    --turnover-at-receiver \
+    --broadcast-fill \
+    --broadcast-raw data/BAR-ATH_broadcast_atd.txt \
+    --broadcast-homography data/BAR-ATH_broadcast_homography.csv \
     --out submission/Placeholders.csv
 ```
-`--flight-barrier` stops the ball changing team while it is in fast flight and nothing deflects it.
-`--confirm-turnover-frames 50` gives a short opponent spell between two spells of the same team
-(A-B-A, under 2 s) back to that team: a touch is not a change of possession.
-*(Executes end-to-end across all 199,319 frames in ~13 seconds).*
+- `--flight-barrier` stops the ball changing team while it is in fast flight and nothing deflects it.
+- `--confirm-turnover-frames 50` gives a short opponent spell between two spells of the same team
+  (A-B-A, under 2 s) back to that team: a touch is not a change of possession.
+- `--turnover-at-receiver` moves each change of team (by at most 2 s) to the first frame where the
+  new team controls the ball.
+- `--broadcast-fill` fills missing tactical ball frames with the broadcast ball position. Each broadcast
+  stretch is aligned to the tactical clock by matching ball positions.
+- `--dead-ball-anchors` exists but is not used in the submission.
+
+*(Executes end-to-end across all 199,319 frames in ~30 seconds).*
 
 ### 4. Validate Submission Format
 Verify that the output file adheres strictly to the competition submission contract:
@@ -79,6 +91,7 @@ final-repo/
 │   ├── Placeholders.md        # Earlier draft of the technical document (superseded by the PDF)
 │   └── Placeholders.pdf       # Final technical document for submission
 ├── scripts/
+│   ├── event_checks.py        # Label-free checks for the receiver, dead-ball and broadcast-fill rules
 │   └── label_free_checks.py   # Compares submission CSVs without ground truth (spell counts, short spells)
 ├── src/
 │   ├── __init__.py
@@ -101,5 +114,8 @@ final-repo/
     ├── test_property_invariants.py
     ├── test_scaled_adversarial_suite.py
     ├── test_tracking_quality.py
+    ├── test_broadcast_fill.py
+    ├── test_dead_ball_anchors.py
+    ├── test_turnover_at_receiver.py
     └── test_turnover_confirm_flight_barrier.py
 ```

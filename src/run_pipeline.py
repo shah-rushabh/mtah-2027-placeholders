@@ -27,20 +27,26 @@ import numpy as np
 # Core Pipeline Stages
 from .control import ControlEvidence, compute_control_evidence
 from .emissions import compute_log_emissions
-from .episodes import EpisodeEvidence, compute_episode_evidence, export_episode_audit
+from .episodes import EpisodeEvidence, compute_episode_evidence, derive_second_half_kickoff, export_episode_audit
+from .games import GAME, half_video_blocks
 from .loader import (
     HOME_TEAM_CODE,
     PITCH_LENGTH,
     PITCH_WIDTH,
     TOTAL_FRAMES,
+    align_broadcast,
+    broadcast_ball_fill,
     load_and_condition_tracking,
     parse_smart_tagging,
+    read_ball_track,
+    read_homography_usable,
 )
 from .postprocess import (
     CODE_TO_CHAR,
     apply_symmetric_dwell_pruning,
     export_submission_csv,
     format_final_submission,
+    move_turnovers_to_receiver,
     rle_encode,
 )
 from .viterbi import viterbi_decode
@@ -65,6 +71,10 @@ def run_pipeline(
     augmented_5state: bool = False,
     flight_barrier: bool = False,
     confirm_turnover_frames: Optional[int] = None,
+    turnover_at_receiver: bool = False,
+    dead_ball_anchors: bool = False,
+    broadcast_raw_path: Optional[str] = None,
+    broadcast_homography_path: Optional[str] = None,
 ) -> str:
     """Executes the full 5-stage pipeline and exports the verified submission CSV.
 
@@ -84,6 +94,13 @@ def run_pipeline(
         flight_barrier: Opt-in. Block H<->A changes while the ball is in fast, undeflected flight.
         confirm_turnover_frames: Opt-in. Give A-B-A spells of team B shorter than this back to A,
             and stop keeping short spells only because of an intentional kick.
+        turnover_at_receiver: Opt-in. Move each H<->A boundary (at most 2 s) to the first frame
+            where the new team controls the ball, so a pass in flight stays with the passer.
+        dead_ball_anchors: Opt-in. D starts at the line crossing and ends at the restart found
+            in the Smart Tagging clip; the second-half kick-off is derived at run time.
+        broadcast_raw_path, broadcast_homography_path: Opt-in. When both are given, tactical
+            frames with no ball take the ball position from the broadcast tracking, after
+            aligning each usable broadcast stretch to the tactical timeline.
 
     Returns:
         output_csv_path: Absolute path to the generated submission file.
@@ -101,6 +118,10 @@ def run_pipeline(
     print(f"\n[Stage 1/{n_stages}] Streaming EPTS tracking & conditioning kinematics...")
     t0 = time.time()
 
+    ball_fill = None
+    if broadcast_raw_path and broadcast_homography_path:
+        ball_fill = compute_broadcast_fill(raw_atd_path, broadcast_raw_path, broadcast_homography_path)
+
     tracking = load_and_condition_tracking(
         raw_path=raw_atd_path,
         meta_path=meta_atd_path,
@@ -109,6 +130,7 @@ def run_pipeline(
         pitch=(PITCH_LENGTH, PITCH_WIDTH),
         micro_gap_max=12,  # 0.48s ballistic flight threshold
         trajectory_strategy=trajectory_strategy,
+        ball_fill=ball_fill,
     )
     smart_tags = parse_smart_tagging(smart_tagging_path)
 
@@ -130,6 +152,7 @@ def run_pipeline(
             smart_tags=smart_tags,
             n_frames=TOTAL_FRAMES,
             pitch=(PITCH_LENGTH, PITCH_WIDTH),
+            dead_ball_anchors=dead_ball_anchors,
         )
 
         print(f"  ✓ Episode evidence computed in {time.time() - t0:.2f}s")
@@ -157,6 +180,14 @@ def run_pipeline(
     print(f"\n[Stage 4/{n_stages}] Computing spatial likelihoods (Strategy: {ownership_strategy}, sigma: {sigma}m)...")
     t0 = time.time()
 
+    h2_kickoff = None
+    if dead_ball_anchors:
+        second_half_start = [first for half, first, _ in half_video_blocks(GAME) if half == 2][0]
+        h2_kickoff = derive_second_half_kickoff(tracking, smart_tags, second_half_start, (PITCH_LENGTH, PITCH_WIDTH))
+        restarts = episode_evidence.set_piece_restarts if episode_evidence is not None else {}
+        print(f"  ✓ Dead-ball anchors: {len(episode_evidence.line_crossings) if episode_evidence is not None else 0} line crossings, "
+              f"{sum(r is not None for r in restarts.values())}/{len(restarts)} restarts found, second-half kick-off at frame {h2_kickoff}")
+
     log_emissions = compute_log_emissions(
         tracking=tracking,
         smart_tags=smart_tags,
@@ -166,6 +197,8 @@ def run_pipeline(
         episode_evidence=episode_evidence,
         control_evidence=control_evidence if augmented_5state else None,
         augmented_5state=augmented_5state,
+        dead_ball_anchors=dead_ball_anchors,
+        h2_kickoff=h2_kickoff,
     )
 
     print(f"  ✓ Log-emissions calculated in {time.time() - t0:.2f}s (Shape: {log_emissions.shape})")
@@ -207,6 +240,17 @@ def run_pipeline(
         intentional_action_A=getattr(control_evidence, "intentional_action_A", None),
         confirm_turnover_frames=confirm_turnover_frames,
     )
+
+    if turnover_at_receiver:
+        before = pruned_path
+        pruned_path = move_turnovers_to_receiver(
+            codes=pruned_path,
+            d_home=np.fmin(tracking.d_H, tracking.d_H_gk),
+            d_away=np.fmin(tracking.d_A, tracking.d_A_gk),
+            ball_velocity=tracking.ball_velocity,
+            ball_valid=tracking.ball_valid,
+        )
+        print(f"  ✓ Turnover at receiver: {int(np.sum(pruned_path != before)):,} frames moved")
 
     final_codes = format_final_submission(codes=pruned_path, n_frames=TOTAL_FRAMES)
 
@@ -276,6 +320,29 @@ def run_pipeline(
     return output_csv_path
 
 
+def compute_broadcast_fill(raw_atd_path: str, broadcast_raw_path: str, broadcast_homography_path: str):
+    """Aligns the broadcast ball track to the tactical timeline and returns (fill_x, fill_y)."""
+    t0 = time.time()
+    def fit(values):
+        out = np.full(TOTAL_FRAMES, np.nan)
+        out[: min(len(values), TOTAL_FRAMES)] = values[:TOTAL_FRAMES]
+        return out
+
+    t_x, t_y = (fit(a) for a in read_ball_track(raw_atd_path, id_base=1))
+    b_x, b_y = read_ball_track(broadcast_raw_path)
+    usable = read_homography_usable(broadcast_homography_path, len(b_x))
+    segments = align_broadcast(t_x, t_y, b_x, b_y, usable, (PITCH_LENGTH, PITCH_WIDTH))
+    fill_x, fill_y = broadcast_ball_fill(t_x, t_y, b_x, b_y, usable, segments)
+    aligned = [seg for seg in segments if seg.offset is not None]
+    offsets = sorted({seg.offset for seg in aligned})
+    print(f"  ✓ Broadcast fill: {len(aligned)}/{len(segments)} usable stretches aligned "
+          f"({sum(seg.stop - seg.start for seg in aligned):,} broadcast frames), "
+          f"{len(offsets)} distinct offsets, median ball error "
+          f"{np.median([seg.error_m for seg in aligned]) if aligned else float('nan'):.2f} m, "
+          f"{int(np.sum(~np.isnan(fill_x))):,} tactical frames filled ({time.time() - t0:.1f}s)")
+    return fill_x, fill_y
+
+
 # =============================================================================
 # CLI ENTRY POINT
 # =============================================================================
@@ -300,6 +367,11 @@ def main():
     parser.add_argument("--augmented-5state", action="store_true", default=False, help="Enable Augmented 5-State Temporal Possession Model")
     parser.add_argument("--flight-barrier", action="store_true", default=False, help="Block H<->A changes while the ball is in fast, undeflected flight")
     parser.add_argument("--confirm-turnover-frames", type=int, default=None, help="Give A-B-A spells of team B shorter than this many frames back to A (50 = 2 s)")
+    parser.add_argument("--turnover-at-receiver", action="store_true", default=False, help="Move each H<->A boundary (at most 2 s) to the frame where the new team controls the ball")
+    parser.add_argument("--dead-ball-anchors", action="store_true", default=False, help="Start D at the line crossing, end it at the Smart Tagging restart, derive the 2nd-half kick-off")
+    parser.add_argument("--broadcast-fill", action="store_true", default=False, help="Fill missing tactical ball frames from the aligned broadcast ball track")
+    parser.add_argument("--broadcast-raw", default=None, help="Broadcast ATD txt (default: next to --raw, 'tactical' -> 'broadcast')")
+    parser.add_argument("--broadcast-homography", default=None, help="Broadcast homography CSV (default: next to --raw)")
 
     args = parser.parse_args()
 
@@ -313,6 +385,16 @@ def main():
     smart_path = args.smart_tagging
     if not os.path.exists(smart_path) and os.path.exists("data/tactical/BAR-ATH_tactical_smart_tagging.xml"):
         smart_path = "data/tactical/BAR-ATH_tactical_smart_tagging.xml"
+
+    broadcast_raw = broadcast_homography = None
+    if args.broadcast_fill:
+        broadcast_raw = args.broadcast_raw or raw_path.replace("tactical", "broadcast")
+        broadcast_homography = args.broadcast_homography or os.path.join(
+            os.path.dirname(raw_path), os.path.basename(raw_path).replace("tactical_atd.txt", "broadcast_homography.csv")
+        )
+        for path in (broadcast_raw, broadcast_homography):
+            if not os.path.exists(path):
+                parser.error(f"--broadcast-fill: file not found: {path}")
 
     run_pipeline(
         raw_atd_path=raw_path,
@@ -333,6 +415,10 @@ def main():
         augmented_5state=args.augmented_5state,
         flight_barrier=args.flight_barrier,
         confirm_turnover_frames=args.confirm_turnover_frames,
+        turnover_at_receiver=args.turnover_at_receiver,
+        dead_ball_anchors=args.dead_ball_anchors,
+        broadcast_raw_path=broadcast_raw,
+        broadcast_homography_path=broadcast_homography,
     )
 
 

@@ -85,6 +85,17 @@ RELAXATION_MAX_ITERATIONS = 6
 # than this is a touch, not a turnover, and goes back to team A.
 DEFAULT_TURNOVER_CONFIRM_FRAMES = 50
 
+# 8c. Turnover at the receiver (opt-in with move_turnovers_to_receiver):
+# An H<->A boundary moves to the first frame where the new team controls the ball.
+# Control means: a new-team player is within reach of the ball, nearer than any opponent,
+# and the ball is slower than the human dribble ceiling (it has slowed down from a pass).
+RECEIVER_MAX_SHIFT_FRAMES = 50       # 2.00 s: a boundary never moves further than this
+RECEIVER_REACH_METERS = 1.8          # 1.80 m: lunging reach (same as control.py contact radius)
+RECEIVER_SLOW_BALL_SPEED = 6.5       # 6.50 m/s: dribble ceiling; a faster ball is still in flight
+RECEIVER_MIN_CONTROL_FRAMES = 3      # 0.12 s: control must last 3 frames, so a fly-by does not count
+RECEIVER_MIN_SPELL_KEEP_FRAMES = 50  # 2.00 s: a move never makes a spell shorter than this
+                                     # (a spell already shorter than this is not shortened)
+
 # 9. Corroborating evidence search offsets & thresholds:
 EVIDENCE_SEARCH_WINDOW_OFFSET = 5
 STOPPAGE_CORROBORATING_PROBABILITY = 0.70
@@ -175,6 +186,122 @@ def merge_unconfirmed_turnovers(
         seg_start, seg_end, _ = segments[best_index]
         segments[best_index] = (seg_start, seg_end, segments[best_index - 1][2])
         segments = _merge_adjacent(segments)
+
+
+def team_control_mask(
+    d_team: np.ndarray,
+    d_other: np.ndarray,
+    ball_velocity: np.ndarray,
+    ball_valid: np.ndarray,
+    reach: float = RECEIVER_REACH_METERS,
+    slow_speed: float = RECEIVER_SLOW_BALL_SPEED,
+    min_frames: int = RECEIVER_MIN_CONTROL_FRAMES,
+) -> np.ndarray:
+    """True on frames where one team controls the ball.
+
+    A frame counts when the ball position is known, the team's nearest player is within
+    `reach`, no opponent is nearer, and the ball is slower than `slow_speed`. Only runs of at
+    least `min_frames` such frames are kept, so a ball that flies past a player does not count.
+    NaN distances (player not tracked) never count.
+    """
+    with np.errstate(invalid="ignore"):
+        other = np.where(np.isnan(d_other), np.inf, d_other)
+        raw = (
+            np.asarray(ball_valid, dtype=bool)
+            & ~np.isnan(d_team)
+            & (d_team <= reach)
+            & (d_team < other)
+            & (ball_velocity <= slow_speed)
+        )
+    if min_frames <= 1 or not np.any(raw):
+        return raw
+    out = np.zeros_like(raw)
+    edges = np.diff(np.concatenate(([0], raw.astype(np.int8), [0])))
+    for start, stop in zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)):
+        if stop - start >= min_frames:
+            out[start:stop] = True
+    return out
+
+
+def _find_reception(ctrl_new: np.ndarray, ctrl_old: np.ndarray, boundary: int, lo: int, hi: int) -> Optional[int]:
+    """Frame where the new team takes control, searched in [lo, hi]; None if there is none.
+
+    1. If the new team controls the ball at the boundary, or gets control before it with no
+       old-team control in between, the turnover is the earliest such control frame (the
+       decoder switched late).
+    2. Otherwise the turnover is the first new-team control frame after the boundary (the
+       decoder switched while the ball was still in flight from the passer).
+    """
+    # Case 1: walk back from the boundary while the old team has no control.
+    earliest = None
+    t = boundary
+    if t <= hi and ctrl_new[t]:
+        earliest = t
+    t = boundary - 1
+    while t >= lo and not ctrl_old[t]:
+        if ctrl_new[t]:
+            earliest = t
+        t -= 1
+    if earliest is not None:
+        return earliest
+    # Case 2: first new-team control after the boundary.
+    after = np.flatnonzero(ctrl_new[boundary + 1 : hi + 1])
+    if len(after):
+        return boundary + 1 + int(after[0])
+    return None
+
+
+def move_turnovers_to_receiver(
+    codes: np.ndarray,
+    d_home: np.ndarray,
+    d_away: np.ndarray,
+    ball_velocity: np.ndarray,
+    ball_valid: np.ndarray,
+    max_shift: int = RECEIVER_MAX_SHIFT_FRAMES,
+    min_keep: int = RECEIVER_MIN_SPELL_KEEP_FRAMES,
+    reach: float = RECEIVER_REACH_METERS,
+    slow_speed: float = RECEIVER_SLOW_BALL_SPEED,
+    min_control_frames: int = RECEIVER_MIN_CONTROL_FRAMES,
+) -> np.ndarray:
+    """Moves each direct H<->A boundary to the frame where the new team controls the ball.
+
+    The frames of a pass in flight stay with the passer's team, because the boundary moves to
+    the reception, not to the kick. Only boundaries between two live spells move; a boundary
+    next to D or X does not. A boundary moves at most `max_shift` frames, and never makes a
+    spell shorter than min(its length, `min_keep`). If no control frame is found in range, the
+    boundary stays.
+
+    Args:
+        codes: State array {0: H, 1: A, 2: D, 3: X}.
+        d_home, d_away: Distance from the ball to the nearest player of each team, goalkeeper
+            included (NaN when unknown).
+        ball_velocity: Ball speed in m/s.
+        ball_valid: True where the ball position is known (observed or bridged).
+    """
+    ctrl = {
+        STATE_H: team_control_mask(d_home, d_away, ball_velocity, ball_valid, reach, slow_speed, min_control_frames),
+        STATE_A: team_control_mask(d_away, d_home, ball_velocity, ball_valid, reach, slow_speed, min_control_frames),
+    }
+    segments = [list(seg) for seg in _merge_adjacent(rle_encode(codes))]
+    for i in range(1, len(segments)):
+        prev_seg, next_seg = segments[i - 1], segments[i]
+        old_state, new_state = prev_seg[2], next_seg[2]
+        if old_state not in (STATE_H, STATE_A) or new_state not in (STATE_H, STATE_A) or old_state == new_state:
+            continue
+        boundary = next_seg[0]
+        prev_len = boundary - prev_seg[0]
+        next_len = next_seg[1] - boundary
+        lo = max(boundary - max_shift, prev_seg[0] + min(prev_len, min_keep))
+        hi = min(boundary + max_shift, next_seg[1] - min(next_len, min_keep))
+        if lo > hi:
+            continue
+        reception = _find_reception(ctrl[new_state], ctrl[old_state], boundary, lo, hi)
+        if reception is None:
+            continue
+        reception = int(min(max(reception, lo), hi))
+        prev_seg[1] = reception
+        next_seg[0] = reception
+    return rle_decode([tuple(seg) for seg in segments], len(codes))
 
 
 # =============================================================================

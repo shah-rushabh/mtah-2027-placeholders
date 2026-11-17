@@ -30,6 +30,13 @@ else
     META_FILE="$DATA_DIR/BAR-ATH_tactical_atd.xml"
     SMART_FILE="$DATA_DIR/BAR-ATH_tactical_smart_tagging.xml"
 fi
+if [ -f "$DATA_DIR/broadcast/BAR-ATH_broadcast_atd.txt" ]; then
+    BROADCAST_RAW="$DATA_DIR/broadcast/BAR-ATH_broadcast_atd.txt"
+    BROADCAST_HOMOGRAPHY="$DATA_DIR/broadcast/BAR-ATH_broadcast_homography.csv"
+else
+    BROADCAST_RAW="$DATA_DIR/BAR-ATH_broadcast_atd.txt"
+    BROADCAST_HOMOGRAPHY="$DATA_DIR/BAR-ATH_broadcast_homography.csv"
+fi
 
 # Detect Python environment
 if [ -n "$VIRTUAL_ENV" ]; then
@@ -49,14 +56,18 @@ echo "Python:          $PYTHON_CMD"
 echo "Input Raw ATD:   $RAW_FILE"
 echo "Input Metadata:  $META_FILE"
 echo "Input Smart Tag: $SMART_FILE"
+echo "Broadcast ATD:   $BROADCAST_RAW"
+echo "Broadcast Homog: $BROADCAST_HOMOGRAPHY"
 echo "Output CSV:      $OUTPUT_CSV"
 echo "================================================================="
 
-if [ ! -f "$RAW_FILE" ]; then
-    echo "Error: Raw tracking file not found at $RAW_FILE"
-    echo "Usage: bash run.sh [DATA_DIR] [OUTPUT_CSV]"
-    exit 1
-fi
+for REQUIRED in "$RAW_FILE" "$BROADCAST_RAW" "$BROADCAST_HOMOGRAPHY"; do
+    if [ ! -f "$REQUIRED" ]; then
+        echo "Error: required input not found at $REQUIRED"
+        echo "Usage: bash run.sh [DATA_DIR] [OUTPUT_CSV]"
+        exit 1
+    fi
+done
 
 # Execute the 6-stage possession pipeline (Production 3-State HMM with Factorized Episode Evidence)
 $PYTHON_CMD -m src.run_pipeline \
@@ -71,7 +82,11 @@ $PYTHON_CMD -m src.run_pipeline \
     --min-same-team-dead 45 \
     --episodes \
     --flight-barrier \
-    --confirm-turnover-frames 50
+    --confirm-turnover-frames 50 \
+    --turnover-at-receiver \
+    --broadcast-fill \
+    --broadcast-raw "$BROADCAST_RAW" \
+    --broadcast-homography "$BROADCAST_HOMOGRAPHY"
 
 echo ""
 echo "================================================================="

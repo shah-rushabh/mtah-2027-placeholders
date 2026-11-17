@@ -2,10 +2,12 @@
 ## Technical Methodology & System Architecture Document
 
 > **Note:** This is an earlier draft. The final technical document is `Placeholders.pdf`.
-> The final submission adds two rules that this draft does not describe:
-> `--flight-barrier` (the ball cannot change team in fast, undeflected flight) and
+> The final submission adds four rules that this draft does not describe:
+> `--flight-barrier` (the ball cannot change team in fast, undeflected flight),
 > `--confirm-turnover-frames 50` (an opponent spell under 2 s between two spells of the same
-> team goes back to that team). `bash run.sh` runs both.
+> team goes back to that team), `--turnover-at-receiver` (a change of team starts when the new
+> team controls the ball) and `--broadcast-fill` (missing tactical ball frames are filled from the
+> broadcast tracking). `bash run.sh` runs all four.
 
 * **Challenge:** Metrica Sports × FC Barcelona × Mobile World Capital Barcelona (*More Than A Hack 2027*, Talent Arena Barcelona)  
 * **Target Match:** FC Barcelona vs. Athletic Club (`BAR-ATH`, 199,319 frames @ 25.0 fps, ~106 minutes across two halves)  

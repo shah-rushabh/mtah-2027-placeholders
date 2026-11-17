@@ -61,6 +61,24 @@ FIELD_SEP = ":"
 GROUP_SEP = ";"
 MISSING_CHAR = "N"
 
+# Broadcast ball fill (opt-in, improvement #5)
+# The broadcast recording has its own timeline (cuts, replays, no mapping table), so each stretch
+# of broadcast frames with a usable homography gets its own frame offset to the tactical video,
+# found by matching the ball positions that both cameras see. Both ATD files use the same 0..1
+# pitch coordinates, so a matched broadcast ball position goes straight into a tactical frame.
+BROADCAST_MAX_REPROJECTION_ERROR = 2.0     # px: trust a broadcast frame below this (95% of valid frames are under 0.74 px)
+BROADCAST_MIN_SEGMENT_FRAMES = 50          # 2.00s: shorter usable stretches are not aligned
+BROADCAST_ALIGN_STRIDE = 5                 # frames: coarse offset grid, refined to 1 frame afterwards
+BROADCAST_ALIGN_REFINE_FRAMES = 5          # frames: refinement half-window around the coarse offset
+BROADCAST_ALIGN_MAX_SAMPLES = 150          # frames per segment used for the coarse search
+BROADCAST_ALIGN_MIN_MATCHES = 15           # co-observed ball frames needed to trust an offset
+BROADCAST_ALIGN_MAX_ERROR_METERS = 1.5     # median ball distance at an accepted offset
+BROADCAST_ALIGN_COST_CAP_METERS = 5.0      # distance cap in the robust offset cost
+BROADCAST_ALIGN_UNIQUENESS_RATIO = 0.5     # best cost must be under half the best cost >= 2 s away
+BROADCAST_ALIGN_EXCLUSION_FRAMES = 50      # 2.00s: "away" for the uniqueness test
+BROADCAST_FILLED_TRACKING_CONFIDENCE = 0.85  # reliability of a ball position taken from the broadcast camera
+BROADCAST_LIVE_OFFSET_MIN_SEGMENTS = 3     # an offset shared by this many stretches (+-REFINE frames) is a live-feed offset
+
 
 # ==============================================================================
 # DATA STRUCTURES
@@ -106,6 +124,7 @@ class TrackingData:
     ball_missing: Optional[np.ndarray] = None        # shape (N,), bool: True if unobserved and not interpolated
     tracking_confidence: Optional[np.ndarray] = None # shape (N,), float 0.0..1.0 reliability indicator
     gk_slots: Optional[Dict[str, int]] = None        # {'H': slot_idx, 'A': slot_idx}
+    ball_from_broadcast: Optional[np.ndarray] = None # shape (N,), bool: ball position taken from the broadcast tracking
 
 
 # ==============================================================================
@@ -264,6 +283,7 @@ def load_and_condition_tracking(
     pitch: Tuple[float, float] = (PITCH_LENGTH, PITCH_WIDTH),
     micro_gap_max: int = MICRO_GAP_MAX_FRAMES,
     trajectory_strategy: str = "neutral_gaps",  # 'neutral_gaps' or 'active_bridging'
+    ball_fill: Optional[Tuple[np.ndarray, np.ndarray]] = None,
 ) -> TrackingData:
     """Streams EPTS raw data, scales coordinates, detects missing gaps, and computes kinematics.
     
@@ -279,6 +299,10 @@ def load_and_condition_tracking(
     - mean_spd < 1.6 m/s: Typical human walking speed (5.7 km/h). When average player speed
       in a gap is < 1.6 m/s, players have stopped running, signifying a referee stoppage.
     - mean_spd >= 2.0 m/s: Active running speed (7.2 km/h), denoting open-play camera occlusions.
+
+    ball_fill (opt-in, improvement #5): (x_norm, y_norm) arrays of length n_frames, NaN where
+    there is no fill. Where the tactical ball is missing and a fill exists, the fill is used as
+    an observed ball position (see broadcast_ball_fill). None keeps the submitted behaviour.
     """
     length, width = pitch
     team_of_track, gk_slots = parse_metadata_roles(meta_path)
@@ -295,6 +319,8 @@ def load_and_condition_tracking(
     ball_y_norm = np.full(n_frames, np.nan, dtype=np.float32)
     ball_observed = np.zeros(n_frames, dtype=bool)
     ball_interpolated = np.zeros(n_frames, dtype=bool)
+    ball_from_broadcast = np.zeros(n_frames, dtype=bool)
+    fill_x, fill_y = ball_fill if ball_fill is not None else (None, None)
 
     d_H = np.full(n_frames, np.nan, dtype=np.float32)
     d_A = np.full(n_frames, np.nan, dtype=np.float32)
@@ -369,6 +395,10 @@ def load_and_condition_tracking(
 
             # Parse ball coordinate
             ball_token = parts[2]
+            if ball_token[0] == MISSING_CHAR and fill_x is not None and not math.isnan(fill_x[frame_id]):
+                # repr() round-trips a float exactly, so the fill goes through the same parser.
+                ball_token = repr(float(fill_x[frame_id])) + "," + repr(float(fill_y[frame_id]))
+                ball_from_broadcast[frame_id] = True
             if ball_token[0] != MISSING_CHAR:
                 ball_comma_idx_1 = ball_token.find(",")
                 if ball_comma_idx_1 != -1:
@@ -553,6 +583,8 @@ def load_and_condition_tracking(
     tracking_confidence = np.zeros(n_frames, dtype=np.float32)
     tracking_confidence[ball_observed] = OBSERVED_TRACKING_CONFIDENCE
     tracking_confidence[ball_interpolated] = INTERPOLATED_TRACKING_CONFIDENCE
+    if ball_fill is not None:
+        tracking_confidence[ball_from_broadcast] = BROADCAST_FILLED_TRACKING_CONFIDENCE
 
     return TrackingData(
         ball_x_metric=ball_x_metric,
@@ -579,4 +611,241 @@ def load_and_condition_tracking(
         ball_missing=ball_missing,
         tracking_confidence=tracking_confidence,
         gk_slots={"H": home_gk_slot, "A": away_gk_slot},
+        ball_from_broadcast=ball_from_broadcast if ball_fill is not None else None,
     )
+
+
+# ==============================================================================
+# BROADCAST BALL FILL (opt-in, improvement #5)
+# ==============================================================================
+@dataclass
+class BroadcastSegment:
+    """One stretch of usable broadcast frames and its frame offset to the tactical video."""
+    start: int           # first broadcast frame (inclusive)
+    stop: int            # last broadcast frame + 1
+    offset: Optional[int]  # tactical_frame = broadcast_frame + offset; None if not aligned
+    error_m: float       # median ball distance (metres) at the offset, over co-observed frames
+    matches: int         # co-observed ball frames at the offset
+
+
+def read_ball_track(raw_path: str, id_base: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
+    """Ball (x, y) in 0..1 pitch units from an EPTS raw file, NaN where missing.
+
+    Row i is frame id `id_base + i`. With id_base=None the smallest frame id in the file is
+    used. The tactical file uses id_base=1 (video_frame = frame_id - 1).
+    """
+    ids, xs, ys = [], [], []
+    with open(raw_path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            parts = line.split(FIELD_SEP)
+            if len(parts) != 3:
+                continue
+            token = parts[2]
+            ids.append(int(parts[0]))
+            if token[0] == MISSING_CHAR or token.find(",") == -1:
+                xs.append(np.nan)
+                ys.append(np.nan)
+                continue
+            c1 = token.find(",")
+            c2 = token.find(",", c1 + 1)
+            xs.append(float(token[:c1]))
+            ys.append(float(token[c1 + 1:c2 if c2 != -1 else len(token)]))
+    if not ids:
+        return np.zeros(0), np.zeros(0)
+    ids = np.asarray(ids)
+    base = int(ids.min()) if id_base is None else id_base
+    n = int(ids.max()) - base + 1
+    bx = np.full(n, np.nan)
+    by = np.full(n, np.nan)
+    keep = ids >= base
+    bx[ids[keep] - base] = np.asarray(xs)[keep]
+    by[ids[keep] - base] = np.asarray(ys)[keep]
+    return bx, by
+
+
+def read_homography_usable(csv_path: str, n_frames: int, max_error: float = BROADCAST_MAX_REPROJECTION_ERROR) -> np.ndarray:
+    """True on frames whose homography is valid and has a reprojection error <= max_error px."""
+    import pandas as pd
+
+    table = pd.read_csv(csv_path, usecols=["frame", "reprojection_error", "valid"])
+    usable = np.zeros(n_frames, dtype=bool)
+    good = (table["valid"].to_numpy() == 1) & (table["reprojection_error"].to_numpy() <= max_error)
+    frames = table["frame"].to_numpy()
+    inside = (frames >= 0) & (frames < n_frames)
+    usable[frames[inside & good]] = True
+    return usable
+
+
+def _segments(mask: np.ndarray, min_len: int) -> List[Tuple[int, int]]:
+    edges = np.diff(np.concatenate(([0], mask.astype(np.int8), [0])))
+    return [(int(a), int(b)) for a, b in zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)) if b - a >= min_len]
+
+
+def _offset_costs(samples, offsets, b_x, b_y, t_x, t_y, cap):
+    """Robust cost and match count of each offset: mean of min(distance, cap) over co-observed samples."""
+    costs = np.full(len(offsets), np.inf)
+    counts = np.zeros(len(offsets), dtype=np.int64)
+    chunk = max(1, 2_000_000 // max(1, len(samples)))
+    for i in range(0, len(offsets), chunk):
+        off = offsets[i:i + chunk]
+        idx = samples[None, :] + off[:, None]
+        dx = t_x[idx] - b_x[samples][None, :]
+        dy = t_y[idx] - b_y[samples][None, :]
+        dist = np.minimum(np.hypot(dx, dy), cap)
+        seen = ~np.isnan(dist)
+        counts[i:i + chunk] = seen.sum(axis=1)
+        with np.errstate(invalid="ignore"):
+            costs[i:i + chunk] = np.where(seen, dist, 0.0).sum(axis=1) / np.maximum(1, counts[i:i + chunk])
+    return costs, counts
+
+
+def _best_offset(frames, candidates, b_x, b_y, t_x, t_y, lo_off, hi_off):
+    """Best offset (refined to one frame around each candidate), its median ball error and matches."""
+    best = (None, float("inf"), 0, float("inf"))
+    for centre in candidates:
+        fine = np.arange(max(lo_off, centre - BROADCAST_ALIGN_REFINE_FRAMES), min(hi_off, centre + BROADCAST_ALIGN_REFINE_FRAMES) + 1)
+        if len(fine) == 0:
+            continue
+        costs, counts = _offset_costs(frames, fine, b_x, b_y, t_x, t_y, BROADCAST_ALIGN_COST_CAP_METERS)
+        costs[counts < BROADCAST_ALIGN_MIN_MATCHES] = np.inf
+        k = int(np.argmin(costs))
+        if costs[k] < best[3]:
+            offset = int(fine[k])
+            dist = np.hypot(t_x[frames + offset] - b_x[frames], t_y[frames + offset] - b_y[frames])
+            dist = dist[~np.isnan(dist)]
+            best = (offset, float(np.median(dist)), int(len(dist)), float(costs[k]))
+    return best[0], best[1], best[2]
+
+
+def align_broadcast(
+    t_x_norm: np.ndarray,
+    t_y_norm: np.ndarray,
+    b_x_norm: np.ndarray,
+    b_y_norm: np.ndarray,
+    b_usable: np.ndarray,
+    pitch: Tuple[float, float] = (PITCH_LENGTH, PITCH_WIDTH),
+) -> List[BroadcastSegment]:
+    """Frame offset of each usable broadcast stretch to the tactical video.
+
+    Pass 1, per stretch of usable broadcast frames (valid homography, low reprojection error) at
+    least BROADCAST_MIN_SEGMENT_FRAMES long:
+      a. Coarse search over every offset that keeps the stretch inside the tactical video, on a
+         BROADCAST_ALIGN_STRIDE grid, with up to BROADCAST_ALIGN_MAX_SAMPLES broadcast ball
+         frames. Cost: mean of min(ball distance, cap) over frames where the tactical camera
+         also sees the ball (at least BROADCAST_ALIGN_MIN_MATCHES of them).
+      b. Refine to one frame around the best coarse offset with every broadcast ball frame.
+      c. Keep it if the median ball distance is <= BROADCAST_ALIGN_MAX_ERROR_METERS and the
+         match is unique: best coarse cost < BROADCAST_ALIGN_UNIQUENESS_RATIO x the best cost
+         more than BROADCAST_ALIGN_EXCLUSION_FRAMES away.
+    Live-feed offsets: offsets kept for at least BROADCAST_LIVE_OFFSET_MIN_SEGMENTS stretches
+    (within +-BROADCAST_ALIGN_REFINE_FRAMES). A live TV feed keeps one offset until time is cut
+    out of the recording (for example halftime).
+    Pass 2:
+      - A kept offset that is not a live-feed offset is a replay. A replay shows the past, so it
+        is kept only if it maps at least BROADCAST_ALIGN_EXCLUSION_FRAMES before the live-feed
+        offset of the nearest live stretch.
+      - A stretch with no unique match (for example a long stoppage with the ball at rest) is
+        tried at each live-feed offset, and kept if the median ball distance is small enough.
+    """
+    length, width = pitch
+    t_x = np.concatenate((np.asarray(t_x_norm, dtype=np.float64) * length, [np.nan]))
+    t_y = np.concatenate((np.asarray(t_y_norm, dtype=np.float64) * width, [np.nan]))
+    b_x = np.asarray(b_x_norm, dtype=np.float64) * length
+    b_y = np.asarray(b_y_norm, dtype=np.float64) * width
+    n_t = len(t_x) - 1
+    b_seen = ~np.isnan(b_x) & np.asarray(b_usable, dtype=bool)
+
+    # Pass 1.
+    stretches = []  # (start, stop, frames, lo_off, hi_off, offset, error, matches, unique)
+    for start, stop in _segments(np.asarray(b_usable, dtype=bool), BROADCAST_MIN_SEGMENT_FRAMES):
+        frames = start + np.flatnonzero(b_seen[start:stop])
+        entry = [start, stop, frames, 0, -1, None, float("nan"), 0, False]
+        stretches.append(entry)
+        if len(frames) < BROADCAST_ALIGN_MIN_MATCHES:
+            continue
+        lo_off, hi_off = -int(frames.min()), n_t - 1 - int(frames.max())
+        entry[3], entry[4] = lo_off, hi_off
+        if hi_off < lo_off:
+            continue
+        samples = frames[np.linspace(0, len(frames) - 1, min(len(frames), BROADCAST_ALIGN_MAX_SAMPLES)).astype(int)]
+        coarse = np.arange(lo_off, hi_off + 1, BROADCAST_ALIGN_STRIDE)
+        costs, counts = _offset_costs(samples, coarse, b_x, b_y, t_x, t_y, BROADCAST_ALIGN_COST_CAP_METERS)
+        costs[counts < min(BROADCAST_ALIGN_MIN_MATCHES, len(samples))] = np.inf
+        if not np.isfinite(costs).any():
+            continue
+        best = int(np.argmin(costs))
+        far = np.abs(coarse - coarse[best]) > BROADCAST_ALIGN_EXCLUSION_FRAMES
+        runner_up = costs[far].min() if far.any() else np.inf
+        offset, error, matches = _best_offset(frames, [int(coarse[best])], b_x, b_y, t_x, t_y, lo_off, hi_off)
+        if offset is None:
+            continue
+        entry[5], entry[6], entry[7] = offset, error, matches
+        entry[8] = error <= BROADCAST_ALIGN_MAX_ERROR_METERS and costs[best] < BROADCAST_ALIGN_UNIQUENESS_RATIO * runner_up
+
+    # Live-feed offsets: clusters of kept offsets.
+    kept = sorted(e[5] for e in stretches if e[8])
+    live_offsets = []
+    i = 0
+    while i < len(kept):
+        j = i
+        while j + 1 < len(kept) and kept[j + 1] - kept[i] <= 2 * BROADCAST_ALIGN_REFINE_FRAMES:
+            j += 1
+        if j - i + 1 >= BROADCAST_LIVE_OFFSET_MIN_SEGMENTS:
+            live_offsets.append(int(np.median(kept[i:j + 1])))
+        i = j + 1
+
+    def is_live(offset):
+        return any(abs(offset - live) <= BROADCAST_ALIGN_REFINE_FRAMES for live in live_offsets)
+
+    live_stretches = [(e[0], e[5]) for e in stretches if e[8] and is_live(e[5])]
+
+    # Pass 2.
+    result: List[BroadcastSegment] = []
+    for start, stop, frames, lo_off, hi_off, offset, error, matches, unique in stretches:
+        accepted = None
+        if unique:
+            if not live_stretches or is_live(offset):
+                accepted = offset
+            else:
+                nearest_live = min(live_stretches, key=lambda item: abs(item[0] - start))[1]
+                if offset < nearest_live - BROADCAST_ALIGN_EXCLUSION_FRAMES:
+                    accepted = offset  # a replay of earlier play
+        elif live_offsets and len(frames) >= BROADCAST_ALIGN_MIN_MATCHES and hi_off >= lo_off:
+            prior, prior_error, prior_matches = _best_offset(frames, live_offsets, b_x, b_y, t_x, t_y, lo_off, hi_off)
+            if prior is not None and prior_error <= BROADCAST_ALIGN_MAX_ERROR_METERS:
+                accepted, error, matches = prior, prior_error, prior_matches
+        result.append(BroadcastSegment(start, stop, accepted, error, matches))
+    return result
+
+
+def broadcast_ball_fill(
+    t_x_norm: np.ndarray,
+    t_y_norm: np.ndarray,
+    b_x_norm: np.ndarray,
+    b_y_norm: np.ndarray,
+    b_usable: np.ndarray,
+    segments: List[BroadcastSegment],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Ball positions for tactical frames where the tactical ball is missing, NaN elsewhere.
+
+    Only aligned segments and usable broadcast frames with a ball are used. If two segments map
+    to the same tactical frame (a replay), the one with the smaller alignment error wins.
+    """
+    n_t = len(t_x_norm)
+    fill_x = np.full(n_t, np.nan)
+    fill_y = np.full(n_t, np.nan)
+    best_error = np.full(n_t, np.inf)
+    t_missing = np.isnan(np.asarray(t_x_norm, dtype=np.float64))
+    for seg in segments:
+        if seg.offset is None:
+            continue
+        frames = np.arange(seg.start, seg.stop)
+        frames = frames[np.asarray(b_usable[seg.start:seg.stop], dtype=bool) & ~np.isnan(b_x_norm[seg.start:seg.stop])]
+        target = frames + seg.offset
+        ok = (target >= 0) & (target < n_t)
+        frames, target = frames[ok], target[ok]
+        ok = t_missing[target] & (seg.error_m < best_error[target])
+        fill_x[target[ok]] = b_x_norm[frames[ok]]
+        fill_y[target[ok]] = b_y_norm[frames[ok]]
+        best_error[target[ok]] = seg.error_m
+    return fill_x, fill_y
