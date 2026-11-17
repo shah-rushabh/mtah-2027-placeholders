@@ -63,6 +63,8 @@ def run_pipeline(
     min_same_team_dead_dwell: int = 45,
     use_episode_engine: bool = True,
     augmented_5state: bool = False,
+    flight_barrier: bool = False,
+    confirm_turnover_frames: Optional[int] = None,
 ) -> str:
     """Executes the full 5-stage pipeline and exports the verified submission CSV.
 
@@ -79,6 +81,9 @@ def run_pipeline(
         min_poss_dwell: Minimum duration for H/A possession spells (default: 30 frames = 1.2s).
         min_dead_dwell: Minimum duration for Dead Ball intervals (default: 35 frames = 1.4s).
         use_episode_engine: Enable Stage 2 multimodal episode evidence engine (default: True).
+        flight_barrier: Opt-in. Block H<->A changes while the ball is in fast, undeflected flight.
+        confirm_turnover_frames: Opt-in. Give A-B-A spells of team B shorter than this back to A,
+            and stop keeping short spells only because of an intentional kick.
 
     Returns:
         output_csv_path: Absolute path to the generated submission file.
@@ -176,6 +181,7 @@ def run_pipeline(
         transition_strategy=transition_strategy,
         episode_evidence=episode_evidence,
         control_evidence=control_evidence if augmented_5state else None,
+        flight_barrier=flight_barrier,
     )
 
     print(f"  ✓ Optimal MAP state sequence decoded in {time.time() - t0:.2f}s")
@@ -199,6 +205,7 @@ def run_pipeline(
         is_deflection=getattr(episode_evidence, "is_deflection", None),
         intentional_action_H=getattr(control_evidence, "intentional_action_H", None),
         intentional_action_A=getattr(control_evidence, "intentional_action_A", None),
+        confirm_turnover_frames=confirm_turnover_frames,
     )
 
     final_codes = format_final_submission(codes=pruned_path, n_frames=TOTAL_FRAMES)
@@ -291,6 +298,8 @@ def main():
     parser.add_argument("--episodes", action="store_true", default=True, help="Enable Stage 2 Episode Evidence Engine")
     parser.add_argument("--no-episodes", dest="episodes", action="store_false", help="Disable Episode Evidence Engine")
     parser.add_argument("--augmented-5state", action="store_true", default=False, help="Enable Augmented 5-State Temporal Possession Model")
+    parser.add_argument("--flight-barrier", action="store_true", default=False, help="Block H<->A changes while the ball is in fast, undeflected flight")
+    parser.add_argument("--confirm-turnover-frames", type=int, default=None, help="Give A-B-A spells of team B shorter than this many frames back to A (50 = 2 s)")
 
     args = parser.parse_args()
 
@@ -322,6 +331,8 @@ def main():
         min_same_team_dead_dwell=args.min_same_team_dead,
         use_episode_engine=args.episodes,
         augmented_5state=args.augmented_5state,
+        flight_barrier=args.flight_barrier,
+        confirm_turnover_frames=args.confirm_turnover_frames,
     )
 
 

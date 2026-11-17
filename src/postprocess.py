@@ -78,6 +78,13 @@ INTER_TEAM_MICRO_DEAD_THRESHOLD_FRAMES = 25
 # 8. Relaxation loop convergence cap:
 RELAXATION_MAX_ITERATIONS = 6
 
+# 8b. Turnover confirmation (opt-in with confirm_turnover_frames):
+# CHALLENGE.md: a change of possession needs *controlled* possession, for example
+# "a player keeps the ball for a few seconds". We use 2 seconds = 50 frames.
+# A short opponent spell between two spells of the same team (A-B-A) that is shorter
+# than this is a touch, not a turnover, and goes back to team A.
+DEFAULT_TURNOVER_CONFIRM_FRAMES = 50
+
 # 9. Corroborating evidence search offsets & thresholds:
 EVIDENCE_SEARCH_WINDOW_OFFSET = 5
 STOPPAGE_CORROBORATING_PROBABILITY = 0.70
@@ -122,6 +129,54 @@ def rle_decode(segments: List[Tuple[int, int, int]], length: int) -> np.ndarray:
     return out
 
 
+def _merge_adjacent(segments: List[Tuple[int, int, int]]) -> List[Tuple[int, int, int]]:
+    """Joins neighbouring segments that have the same state."""
+    merged: List[Tuple[int, int, int]] = []
+    for s, e, v in segments:
+        if merged and merged[-1][2] == v:
+            merged[-1] = (merged[-1][0], e, v)
+        else:
+            merged.append((s, e, v))
+    return merged
+
+
+def merge_unconfirmed_turnovers(
+    segments: List[Tuple[int, int, int]],
+    confirm_frames: int,
+    p_restart: Optional[np.ndarray] = None,
+) -> List[Tuple[int, int, int]]:
+    """Gives short A-B-A opponent spells back to team A.
+
+    A spell of team B between two spells of team A is kept only if it lasts at least
+    `confirm_frames`, or if a legal restart is detected inside it. Shortest spells are
+    merged first, and the pass repeats until nothing changes.
+    """
+    segments = _merge_adjacent(segments)
+    while True:
+        best_index = None
+        best_duration = None
+        for i in range(1, len(segments) - 1):
+            seg_start, seg_end, seg_state = segments[i]
+            prev_state = segments[i - 1][2]
+            next_state = segments[i + 1][2]
+            if seg_state not in (STATE_H, STATE_A):
+                continue
+            if prev_state != next_state or prev_state not in (STATE_H, STATE_A) or prev_state == seg_state:
+                continue
+            duration = seg_end - seg_start
+            if duration >= confirm_frames:
+                continue
+            if p_restart is not None and np.any(p_restart[seg_start:seg_end] > RESTART_CORROBORATING_PROBABILITY):
+                continue
+            if best_duration is None or duration < best_duration:
+                best_index, best_duration = i, duration
+        if best_index is None:
+            return segments
+        seg_start, seg_end, _ = segments[best_index]
+        segments[best_index] = (seg_start, seg_end, segments[best_index - 1][2])
+        segments = _merge_adjacent(segments)
+
+
 # =============================================================================
 # 5. CONTEXT-AWARE SYMMETRIC DWELL PRUNER
 # =============================================================================
@@ -140,6 +195,7 @@ def apply_symmetric_dwell_pruning(
     p_dead: Optional[np.ndarray] = None,
     intentional_action_H: Optional[np.ndarray] = None,
     intentional_action_A: Optional[np.ndarray] = None,
+    confirm_turnover_frames: Optional[int] = None,
 ) -> np.ndarray:
     """Applies context-aware dwell filtering and physical bridge healing:
 
@@ -158,6 +214,10 @@ def apply_symmetric_dwell_pruning(
         p_dead: Stoppage evidence probabilities to preserve genuine stoppages.
         intentional_action_H: Intentional first-time passes/shots by Home.
         intentional_action_A: Intentional first-time passes/shots by Away.
+        confirm_turnover_frames: Opt-in. When set, (1) a short spell is no longer kept just
+            because an intentional kick happened in it, and (2) A-B-A spells of team B shorter
+            than this are given back to team A (see merge_unconfirmed_turnovers). None keeps
+            the submitted behaviour.
 
     Returns:
         Pruned state array of shape (N,).
@@ -304,7 +364,11 @@ def apply_symmetric_dwell_pruning(
                     if p_restart is not None and np.any(p_restart[seg_start:seg_end] > RESTART_CORROBORATING_PROBABILITY):
                         has_corroborating_possession_evidence = True
 
-                if segment_duration_frames >= INTENTIONAL_ACTION_PROTECT_MIN_FRAMES and not has_corroborating_possession_evidence:
+                if (
+                    confirm_turnover_frames is None
+                    and segment_duration_frames >= INTENTIONAL_ACTION_PROTECT_MIN_FRAMES
+                    and not has_corroborating_possession_evidence
+                ):
                     if seg_state == STATE_H and intentional_action_H is not None and np.any(intentional_action_H[seg_start:seg_end]):
                         has_corroborating_possession_evidence = True
                     elif seg_state == STATE_A and intentional_action_A is not None and np.any(intentional_action_A[seg_start:seg_end]):
@@ -343,6 +407,9 @@ def apply_symmetric_dwell_pruning(
             else:
                 merged_segments.append((s, e, v))
         segments = merged_segments
+
+    if confirm_turnover_frames is not None:
+        segments = merge_unconfirmed_turnovers(segments, confirm_turnover_frames, p_restart=p_restart)
 
     return rle_decode(segments, len(codes))
 

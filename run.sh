@@ -69,7 +69,9 @@ $PYTHON_CMD -m src.run_pipeline \
     --min-poss 30 \
     --min-dead 35 \
     --min-same-team-dead 45 \
-    --episodes
+    --episodes \
+    --flight-barrier \
+    --confirm-turnover-frames 50
 
 echo ""
 echo "================================================================="

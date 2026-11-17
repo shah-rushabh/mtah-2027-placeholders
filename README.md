@@ -47,8 +47,13 @@ python3 -m src.run_pipeline \
     --raw data/BAR-ATH_tactical_atd.txt \
     --meta data/BAR-ATH_tactical_atd.xml \
     --smart-tagging data/BAR-ATH_tactical_smart_tagging.xml \
+    --flight-barrier \
+    --confirm-turnover-frames 50 \
     --out submission/Placeholders.csv
 ```
+`--flight-barrier` stops the ball changing team while it is in fast flight and nothing deflects it.
+`--confirm-turnover-frames 50` gives a short opponent spell between two spells of the same team
+(A-B-A, under 2 s) back to that team: a touch is not a change of possession.
 *(Executes end-to-end across all 199,319 frames in ~13 seconds).*
 
 ### 4. Validate Submission Format
@@ -71,8 +76,10 @@ final-repo/
 ├── run.sh                     # Reproduction script (generates Placeholders.csv in ~13s)
 ├── submission/                # Final competition deliverables
 │   ├── Placeholders.csv       # The certified 199,319-row submission file
-│   ├── Placeholders.md        # Technical approach document
-│   └── Placeholders.pdf       # Compiled technical document for submission
+│   ├── Placeholders.md        # Earlier draft of the technical document (superseded by the PDF)
+│   └── Placeholders.pdf       # Final technical document for submission
+├── scripts/
+│   └── label_free_checks.py   # Compares submission CSVs without ground truth (spell counts, short spells)
 ├── src/
 │   ├── __init__.py
 │   ├── loader.py              # Stage 1: Data Ingestion & Missingness Engine
@@ -93,5 +100,6 @@ final-repo/
     ├── test_possession_control_semantics.py
     ├── test_property_invariants.py
     ├── test_scaled_adversarial_suite.py
-    └── test_tracking_quality.py
+    ├── test_tracking_quality.py
+    └── test_turnover_confirm_flight_barrier.py
 ```

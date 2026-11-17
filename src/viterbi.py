@@ -59,6 +59,12 @@ CONFIRMED_RESTART_TRANSITION_PENALTY = -0.1
 # An opponent touch without sustained control or an intentional pass/clearance receives a -6.0 penalty:
 UNCONFIRMED_TURNOVER_PENALTY = -6.0
 
+# In-flight barrier (restored from Exp23, opt-in with flight_barrier=True):
+# While the ball is in fast flight (p_fast_transit > 0.5) and no deflection is detected,
+# a change between H and A costs an extra -4.0. A ball in the air cannot change team.
+FAST_TRANSIT_PROBABILITY_THRESHOLD = 0.5
+FAST_TRANSIT_TURNOVER_PENALTY = -4.0
+
 # =============================================================================
 # 3. 5-STATE ROW-STOCHASTIC BASE TRANSITION MATRIX
 # =============================================================================
@@ -123,6 +129,7 @@ def viterbi_decode(
     episode_evidence: Optional[EpisodeEvidence] = None,
     is_deflection: Optional[np.ndarray] = None,
     control_evidence: Optional[ControlEvidence] = None,
+    flight_barrier: bool = False,
 ) -> np.ndarray:
     """Decodes globally optimal state sequence using dynamic programming MAP inference.
 
@@ -147,6 +154,9 @@ def viterbi_decode(
         episode_evidence: Optional macro game phase kinematic evidence from Stage 2.
         is_deflection: Optional boolean mask of deflection events.
         control_evidence: Optional micro interaction and turnover evidence from Stage 3.
+        flight_barrier: 3-state only. Add FAST_TRANSIT_TURNOVER_PENALTY to H<->A changes
+            while the ball is in fast flight and not deflected. Off by default, so the
+            submitted run is unchanged.
 
     Returns:
         optimal_state_sequence: np.ndarray of shape (n_frames,) containing decoded labels in {0, 1, 2}.
@@ -180,6 +190,9 @@ def viterbi_decode(
     prob_dead = episode_evidence.p_dead if has_episodes else None
     prob_restart = episode_evidence.p_restart_candidate if has_episodes else None
     restart_team = episode_evidence.restart_team if has_episodes else None
+    fast_transit = episode_evidence.p_fast_transit if (has_episodes and flight_barrier) else None
+    if fast_transit is not None and is_deflection is None:
+        is_deflection = getattr(episode_evidence, "is_deflection", None)
     has_control = control_evidence is not None
 
     # =========================================================================
@@ -266,6 +279,16 @@ def viterbi_decode(
                             current_transition_log_matrix = base_log_A.copy()
                             matrix_needs_copy = True
                         current_transition_log_matrix[STATE_D, kicking_team] = CONFIRMED_RESTART_TRANSITION_PENALTY
+
+                # 3. In-flight barrier (opt-in):
+                if fast_transit is not None and fast_transit[frame_idx] > FAST_TRANSIT_PROBABILITY_THRESHOLD:
+                    deflected = is_deflection is not None and bool(is_deflection[frame_idx])
+                    if not deflected:
+                        if not matrix_needs_copy:
+                            current_transition_log_matrix = base_log_A.copy()
+                            matrix_needs_copy = True
+                        current_transition_log_matrix[STATE_H, STATE_A] += FAST_TRANSIT_TURNOVER_PENALTY
+                        current_transition_log_matrix[STATE_A, STATE_H] += FAST_TRANSIT_TURNOVER_PENALTY
 
         # Bellman broadcast update:
         # running_best_scores[:, np.newaxis] broadcasts over destination states j (shape K, K)
