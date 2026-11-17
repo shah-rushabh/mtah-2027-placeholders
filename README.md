@@ -45,20 +45,8 @@ bash run.sh /path/to/data [OUTPUT_CSV]
 ```
 `run.sh` changes into the repository folder before it runs. Run it from the repository root, or pass
 absolute paths for `DATA_DIR` and `OUTPUT_CSV`.
-Or directly via Python:
-```bash
-python3 -m src.run_pipeline \
-    --raw data/BAR-ATH_tactical_atd.txt \
-    --meta data/BAR-ATH_tactical_atd.xml \
-    --smart-tagging data/BAR-ATH_tactical_smart_tagging.xml \
-    --flight-barrier \
-    --confirm-turnover-frames 50 \
-    --turnover-at-receiver \
-    --broadcast-fill \
-    --broadcast-raw data/BAR-ATH_broadcast_atd.txt \
-    --broadcast-homography data/BAR-ATH_broadcast_homography.csv \
-    --out submission/Placeholders.csv
-```
+
+`run.sh` turns on these four rules:
 - `--flight-barrier` stops the ball changing team while it is in fast flight and nothing deflects it.
 - `--confirm-turnover-frames 50` gives a short opponent spell between two spells of the same team
   (A-B-A, under 2 s) back to that team: a touch is not a change of possession.
@@ -66,7 +54,8 @@ python3 -m src.run_pipeline \
   new team controls the ball.
 - `--broadcast-fill` fills missing tactical ball frames with the broadcast ball position. Each broadcast
   stretch is aligned to the tactical clock by matching ball positions.
-- `--dead-ball-anchors` exists but is not used in the submission.
+
+The code also has a `--dead-ball-anchors` option. The submission does not use it.
 
 *(Executes end-to-end across all 199,319 frames in ~30 seconds).*
 
