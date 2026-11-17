@@ -59,7 +59,7 @@ CONFIRMED_RESTART_TRANSITION_PENALTY = -0.1
 # An opponent touch without sustained control or an intentional pass/clearance receives a -6.0 penalty:
 UNCONFIRMED_TURNOVER_PENALTY = -6.0
 
-# In-flight barrier (restored from Exp23, opt-in with flight_barrier=True):
+# In-flight barrier (opt-in with flight_barrier=True):
 # While the ball is in fast flight (p_fast_transit > 0.5) and no deflection is detected,
 # a change between H and A costs an extra -4.0. A ball in the air cannot change team.
 FAST_TRANSIT_PROBABILITY_THRESHOLD = 0.5

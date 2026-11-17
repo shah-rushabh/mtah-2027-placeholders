@@ -130,9 +130,8 @@ To enforce this principle without overfitting to individual match incidents, we 
 ## 3. Training Data & Label Provenance
 
 In strict compliance with competition rules:
-* **Zero Label Tuning / Zero Supervised Fitting:** No thresholds, decay factors, transition penalties, or dwell limits were fitted or tuned against match labels or external statistics.
 * **Zero Human Annotations:** No human watching video footage manually created label lookup tables or frame-specific rules.
-* **Physics & Literature Grounding:** All parameters stand strictly on IFAB Laws of the Game, athletic movement ceilings (Weyand et al., 2000), and peer-reviewed sports science literature (Spearman et al., 2017; Link et al., 2016).
+* **Physics & Literature Grounding:** Parameters draw on IFAB Laws of the Game, athletic movement ceilings (Weyand et al., 2000), and peer-reviewed sports science literature (Spearman et al., 2017; Link et al., 2016).
 
 ---
 

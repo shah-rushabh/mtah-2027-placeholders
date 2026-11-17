@@ -19,7 +19,7 @@ Official competition entry for the **Metrica Sports × FC Barcelona × Mobile Wo
 ## Quickstart & Reproduction Guide
 
 ### 1. Requirements & Setup
-The engine requires Python >= 3.9 (tested on Python 3.9.6) and standard scientific dependencies:
+The engine requires Python 3.9–3.12 (tested on Python 3.9.6) and standard scientific dependencies:
 ```bash
 pip install -r requirements.txt
 ```
@@ -43,6 +43,8 @@ bash run.sh
 # Or specifying a custom data directory:
 bash run.sh /path/to/data [OUTPUT_CSV]
 ```
+`run.sh` changes into the repository folder before it runs. Run it from the repository root, or pass
+absolute paths for `DATA_DIR` and `OUTPUT_CSV`.
 Or directly via Python:
 ```bash
 python3 -m src.run_pipeline \
@@ -80,12 +82,12 @@ python3 -m src.validate_submission submission/Placeholders.csv
 ## Repository Layout
 
 ```
-final-repo/
+./
 ├── .gitignore                 # Excludes raw data, video, and local caches
 ├── LICENSE                    # MIT License (includes Metrica Sports attribution)
 ├── README.md                  # This document
 ├── requirements.txt           # Pinned dependencies (numpy==2.0.2, pandas==2.3.3)
-├── run.sh                     # Reproduction script (generates Placeholders.csv in ~13s)
+├── run.sh                     # Reproduction script (generates Placeholders.csv in ~30s)
 ├── submission/                # Final competition deliverables
 │   ├── Placeholders.csv       # The certified 199,319-row submission file
 │   ├── Placeholders.md        # Earlier draft of the technical document (superseded by the PDF)
