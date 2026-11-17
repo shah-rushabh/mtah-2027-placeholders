@@ -1,0 +1,44 @@
+# =============================================================================
+# MTAH 2027 .gitignore — Protect Competition & Match-Derived Assets
+# =============================================================================
+# Match data is licensed for competition use only and must not be committed (RULES.md)
+data/
+raw_data/
+gt/
+*_gt*
+*_atd.txt
+*_atd.xml
+*_smart_tagging.xml
+*_homography.csv
+*.txt
+!requirements.txt
+*.xml
+
+# Raw video and broadcast media
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.ts
+
+# Intermediate & diagnostic match outputs
+src/results/
+results/
+*.audit.csv
+episode_audit*.csv
+*missing_gap*.md
+*gap_report*.md
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# System and logs
+.DS_Store
+*.log
