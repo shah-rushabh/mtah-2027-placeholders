@@ -12,7 +12,7 @@ Official competition entry for the **Metrica Sports × FC Barcelona × Mobile Wo
 * **Possession File:** [`submission/Placeholders.csv`](submission/Placeholders.csv)  
   Certified submission file containing exactly 199,319 frames formatted as `frame,label`.
 * **Technical Document:** [`submission/Placeholders.pdf`](submission/Placeholders.pdf)  
-  Methodology document covering core axioms, pipeline stages, IFAB rules, running pace table, and limitations ([Markdown source](submission/Placeholders.md)).
+  Technical document covering the approach, pipeline steps, possession rules, assets used, limitations, and reproduction.
 
 ---
 
@@ -90,7 +90,6 @@ python3 -m src.validate_submission submission/Placeholders.csv
 ├── run.sh                     # Reproduction script (generates Placeholders.csv in ~30s)
 ├── submission/                # Final competition deliverables
 │   ├── Placeholders.csv       # The certified 199,319-row submission file
-│   ├── Placeholders.md        # Earlier draft of the technical document (superseded by the PDF)
 │   └── Placeholders.pdf       # Final technical document for submission
 ├── scripts/
 │   ├── event_checks.py        # Label-free checks for the receiver, dead-ball and broadcast-fill rules
