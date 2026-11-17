@@ -91,9 +91,6 @@ python3 -m src.validate_submission submission/Placeholders.csv
 ├── submission/                # Final competition deliverables
 │   ├── Placeholders.csv       # The certified 199,319-row submission file
 │   └── Placeholders.pdf       # Final technical document for submission
-├── scripts/
-│   ├── event_checks.py        # Label-free checks for the receiver, dead-ball and broadcast-fill rules
-│   └── label_free_checks.py   # Compares submission CSVs without ground truth (spell counts, short spells)
 ├── src/
 │   ├── __init__.py
 │   ├── loader.py              # Stage 1: Data Ingestion & Missingness Engine
